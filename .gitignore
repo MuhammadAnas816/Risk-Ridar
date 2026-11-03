@@ -69,3 +69,9 @@ android/build/reports/
 
 android/key.properties
 android/app/*.jks
+
+# Backups and temporary test logs
+*.bak*
+*.txt
+.gradle/
+**/.gradle/

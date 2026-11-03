@@ -8,6 +8,8 @@ import 'package:image_cropper/image_cropper.dart';
 import 'package:riskradar/shared/security/input_sanitizer.dart';
 import 'package:riskradar/shared/utils/profile_photo_permission.dart';
 import 'package:riskradar/shared/widgets/full_image_viewer.dart';
+import 'package:riskradar/services/repositories/sync_repository.dart';
+import 'package:riskradar/services/sync_service.dart';
 
 class HSEWorkerEditProfileScreen extends StatefulWidget {
   const HSEWorkerEditProfileScreen({super.key});
@@ -21,6 +23,7 @@ class _HSEWorkerEditProfileScreenState
     extends State<HSEWorkerEditProfileScreen> {
   final SupabaseClient supabase = Supabase.instance.client;
   final ImagePicker _picker = ImagePicker();
+  final SyncRepository _syncRepository = SyncRepository();
 
   bool _loading = true;
   bool _editing = false;
@@ -184,46 +187,78 @@ class _HSEWorkerEditProfileScreenState
         return;
       }
 
-      File? croppedImage = await _cropImage(File(image.path));
+      final File? croppedImage = await _cropImage(File(image.path));
       if (croppedImage == null) {
         return;
       }
 
-      setState(() => _uploadingImage = true);
-
-      final userId = supabase.auth.currentUser!.id;
-      final fileExt = image.path.split('.').last;
-      final fileName =
-          '$userId/${DateTime.now().millisecondsSinceEpoch}.$fileExt';
-
-      await supabase.storage
-          .from('profile-images')
-          .upload(
-            fileName,
-            croppedImage,
-            fileOptions: const FileOptions(upsert: true),
+      final String? userId = supabase.auth.currentUser?.id;
+      if (userId == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('You must be signed in to update your photo.'),
+            ),
           );
+        }
+        return;
+      }
 
-      final String publicUrl = supabase.storage
-          .from('profile-images')
-          .getPublicUrl(fileName);
-
-      await supabase
-          .from('hse_workers')
-          .update({'profile_image_url': publicUrl})
-          .eq('id', userId);
-
-      await _loadProfile();
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text("Profile photo updated!")));
+        setState(() => _uploadingImage = true);
+      }
+
+      final Map<String, Object?> payload = <String, Object?>{
+        'id': userId,
+        'profile_image_url': _initialData?['profile_image_url'],
+        'image_paths': <String>[croppedImage.path],
+      };
+
+      await _syncRepository.enqueueAction(
+        id: 'hse_profile_photo_${userId}_${DateTime.now().millisecondsSinceEpoch}',
+        table: 'hse_workers',
+        action: 'update',
+        payload: payload,
+      );
+
+      final SyncResult syncResult = await SyncService.instance.run();
+
+      if (syncResult.rejected > 0) {
+        throw StateError('Profile photo update was rejected.');
+      }
+
+      final bool queued =
+          syncResult.reason != null ||
+          syncResult.hasFailures ||
+          syncResult.pending > 0;
+
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            queued
+                ? 'Profile photo saved. It will sync automatically when online.'
+                : 'Profile photo updated successfully!',
+          ),
+          backgroundColor: queued ? Colors.orange : const Color(0xFF1B3D3D),
+        ),
+      );
+
+      if (!queued) {
+        await _loadProfile();
       }
     } catch (e) {
-      debugPrint("Upload Error: $e");
+      debugPrint('HSE profile photo update failed: $e');
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Upload failed. Please try again.")),
+          const SnackBar(
+            content: Text('Profile photo update failed. Please try again.'),
+            backgroundColor: Colors.red,
+          ),
         );
       }
     } finally {
@@ -361,226 +396,231 @@ class _HSEWorkerEditProfileScreenState
             child: ConstrainedBox(
               constraints: BoxConstraints(minHeight: size.height),
               child: Column(
-              children: [
-                Center(
-                  child: Stack(
-                    alignment: Alignment.bottomRight,
-                    children: [
-                      GestureDetector(
-                        onTap: () {
-                          if (imageUrl != null && imageUrl.isNotEmpty) {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) => FullscreenImageViewer(
-                                  imageUrls: [imageUrl],
-                                  initialIndex: 0,
-                                ),
-                              ),
-                            );
-                          }
-                        },
-                        child: Container(
-                          padding: EdgeInsets.all(size.width * 0.010),
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            shape: BoxShape.circle,
-                          ),
-                          child: Hero(
-                            tag: 'profile_pic',
-                            child: CircleAvatar(
-                              radius: size.width * 0.118,
-                              backgroundColor: Colors.grey.shade300,
-                              backgroundImage:
-                                  (imageUrl != null && imageUrl.isNotEmpty)
-                                  ? NetworkImage(imageUrl)
-                                  : null,
-                              child: _uploadingImage
-                                  ? const CircularProgressIndicator(
-                                      color: tealColor,
-                                    )
-                                  : (imageUrl == null || imageUrl.isEmpty)
-                                  ? Icon(
-                                      Icons.person,
-                                      size: size.width * 0.118,
-                                      color: Colors.grey,
-                                    )
-                                  : null,
-                            ),
-                          ),
-                        ),
-                      ),
-
-                      if (_editing)
+                children: [
+                  Center(
+                    child: Stack(
+                      alignment: Alignment.bottomRight,
+                      children: [
                         GestureDetector(
-                          onTap: _pickAndUploadImage,
-                          child: Container(
-                            padding: EdgeInsets.all(size.width * 0.016),
-                            decoration: BoxDecoration(
-                              color: goldColor,
-                              shape: BoxShape.circle,
-                              boxShadow: <BoxShadow>[
-                                BoxShadow(
-                                  color: Colors.black26,
-                                  blurRadius: size.width * 0.011,
+                          onTap: () {
+                            if (imageUrl != null && imageUrl.isNotEmpty) {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => FullscreenImageViewer(
+                                    imageUrls: [imageUrl],
+                                    initialIndex: 0,
+                                  ),
                                 ),
-                              ],
-                            ),
-                            child: Icon(
-                              Icons.camera_alt,
+                              );
+                            }
+                          },
+                          child: Container(
+                            padding: EdgeInsets.all(size.width * 0.010),
+                            decoration: BoxDecoration(
                               color: Colors.white,
-                              size: size.width * 0.044,
+                              shape: BoxShape.circle,
+                            ),
+                            child: Hero(
+                              tag: 'profile_pic',
+                              child: CircleAvatar(
+                                radius: size.width * 0.118,
+                                backgroundColor: Colors.grey.shade300,
+                                backgroundImage:
+                                    (imageUrl != null && imageUrl.isNotEmpty)
+                                    ? NetworkImage(imageUrl)
+                                    : null,
+                                child: _uploadingImage
+                                    ? const CircularProgressIndicator(
+                                        color: tealColor,
+                                      )
+                                    : (imageUrl == null || imageUrl.isEmpty)
+                                    ? Icon(
+                                        Icons.person,
+                                        size: size.width * 0.118,
+                                        color: Colors.grey,
+                                      )
+                                    : null,
+                              ),
                             ),
                           ),
                         ),
-                    ],
-                  ),
-                ),
 
-                SizedBox(height: visibleHeight * 0.005),
-
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      fullName.isEmpty ? "User Profile" : fullName,
-                      style: TextStyle(
-                        fontSize: size.width * 0.046,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                        letterSpacing: 0.5,
-                      ),
+                        if (_editing)
+                          GestureDetector(
+                            onTap: _pickAndUploadImage,
+                            child: Container(
+                              padding: EdgeInsets.all(size.width * 0.016),
+                              decoration: BoxDecoration(
+                                color: goldColor,
+                                shape: BoxShape.circle,
+                                boxShadow: <BoxShadow>[
+                                  BoxShadow(
+                                    color: Colors.black26,
+                                    blurRadius: size.width * 0.011,
+                                  ),
+                                ],
+                              ),
+                              child: Icon(
+                                Icons.camera_alt,
+                                color: Colors.white,
+                                size: size.width * 0.044,
+                              ),
+                            ),
+                          ),
+                      ],
                     ),
-                    SizedBox(width: size.width * 0.027),
-                    GestureDetector(
-                      onTap: () => setState(() => _editing = !_editing),
-                      child: Container(
-                        padding: EdgeInsets.all(size.width * 0.013),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.2),
-                          shape: BoxShape.circle,
-                        ),
-                        child: Icon(
-                          _editing ? Icons.close : Icons.edit,
-                          color: Colors.white,
-                          size: size.width * 0.039,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                SizedBox(height: visibleHeight * 0.004),
-                Text(
-                  _designationController.text.toUpperCase(),
-                  style: TextStyle(
-                    color: Colors.white.withValues(alpha: 0.7),
-                    fontSize: size.width * 0.028,
-                    letterSpacing: 1,
                   ),
-                ),
 
-                SizedBox(height: visibleHeight * 0.030),
+                  SizedBox(height: visibleHeight * 0.005),
 
-                Container(
-                  margin: EdgeInsets.symmetric(horizontal: size.width * 0.050),
-                  padding: EdgeInsets.symmetric(
-                    horizontal: size.width * 0.042,
-                    vertical: visibleHeight * 0.018,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(size.width * 0.053),
-                    boxShadow: <BoxShadow>[
-                      BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.05),
-                        blurRadius: size.width * 0.053,
-                        offset: Offset(size.width * 0.0, visibleHeight * 0.013),
-                      ),
-                    ],
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Text(
-                        "USER DETAILS",
+                        fullName.isEmpty ? "User Profile" : fullName,
                         style: TextStyle(
+                          fontSize: size.width * 0.046,
                           fontWeight: FontWeight.bold,
-                          fontSize: size.width * 0.038,
-                          color: tealColor,
+                          color: Colors.white,
+                          letterSpacing: 0.5,
                         ),
                       ),
-                      SizedBox(height: visibleHeight * 0.011),
-                      _buildStyledTextField(
-                        "First Name",
-                        _firstNameController,
-                        Icons.person_outline,
-                      ),
-                      _buildStyledTextField(
-                        "Last Name",
-                        _lastNameController,
-                        Icons.person_outline,
-                      ),
-                      _buildStyledTextField(
-                        "Email ID",
-                        _emailController,
-                        Icons.email_outlined,
-                        readOnly: true,
-                      ),
-                      // ✅ UPDATED: Passing _selectDate for custom tap handling
-                      _buildStyledTextField(
-                        "Date of Birth",
-                        _dobController,
-                        Icons.calendar_today_outlined,
-                        onTap: _selectDate,
-                      ),
-                      _buildStyledTextField(
-                        "Designation",
-                        _designationController,
-                        Icons.badge_outlined,
-                      ),
-                      _buildStyledTextField(
-                        "Contractor UID",
-                        _officerUidController,
-                        Icons.admin_panel_settings_outlined,
-                        readOnly: true,
-                      ),
-                      SizedBox(height: visibleHeight * 0.006),
-                      if (_editing)
-                        SizedBox(
-                          width: double.infinity,
-                          height: visibleHeight * 0.060,
-                          child: ElevatedButton(
-                            onPressed: _hasChanges && !_updating
-                                ? _updateProfile
-                                : null,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: goldColor,
-                              disabledBackgroundColor: Colors.grey.shade300,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(
-                                  size.width * 0.077,
-                                ),
-                              ),
-                              elevation: size.width * 0.013,
-                            ),
-                            child: _updating
-                                ? const CircularProgressIndicator(
-                                    color: Colors.white,
-                                  )
-                                : Text(
-                                    "SAVE DETAILS",
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: size.width * 0.038,
-                                    ),
-                                  ),
+                      SizedBox(width: size.width * 0.027),
+                      GestureDetector(
+                        onTap: () => setState(() => _editing = !_editing),
+                        child: Container(
+                          padding: EdgeInsets.all(size.width * 0.013),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.2),
+                            shape: BoxShape.circle,
+                          ),
+                          child: Icon(
+                            _editing ? Icons.close : Icons.edit,
+                            color: Colors.white,
+                            size: size.width * 0.039,
                           ),
                         ),
+                      ),
                     ],
                   ),
-                ),
-              ],
+                  SizedBox(height: visibleHeight * 0.004),
+                  Text(
+                    _designationController.text.toUpperCase(),
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.7),
+                      fontSize: size.width * 0.028,
+                      letterSpacing: 1,
+                    ),
+                  ),
+
+                  SizedBox(height: visibleHeight * 0.030),
+
+                  Container(
+                    margin: EdgeInsets.symmetric(
+                      horizontal: size.width * 0.050,
+                    ),
+                    padding: EdgeInsets.symmetric(
+                      horizontal: size.width * 0.042,
+                      vertical: visibleHeight * 0.018,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(size.width * 0.053),
+                      boxShadow: <BoxShadow>[
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.05),
+                          blurRadius: size.width * 0.053,
+                          offset: Offset(
+                            size.width * 0.0,
+                            visibleHeight * 0.013,
+                          ),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          "USER DETAILS",
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: size.width * 0.038,
+                            color: tealColor,
+                          ),
+                        ),
+                        SizedBox(height: visibleHeight * 0.011),
+                        _buildStyledTextField(
+                          "First Name",
+                          _firstNameController,
+                          Icons.person_outline,
+                        ),
+                        _buildStyledTextField(
+                          "Last Name",
+                          _lastNameController,
+                          Icons.person_outline,
+                        ),
+                        _buildStyledTextField(
+                          "Email ID",
+                          _emailController,
+                          Icons.email_outlined,
+                          readOnly: true,
+                        ),
+                        // ✅ UPDATED: Passing _selectDate for custom tap handling
+                        _buildStyledTextField(
+                          "Date of Birth",
+                          _dobController,
+                          Icons.calendar_today_outlined,
+                          onTap: _selectDate,
+                        ),
+                        _buildStyledTextField(
+                          "Designation",
+                          _designationController,
+                          Icons.badge_outlined,
+                        ),
+                        _buildStyledTextField(
+                          "Contractor UID",
+                          _officerUidController,
+                          Icons.admin_panel_settings_outlined,
+                          readOnly: true,
+                        ),
+                        SizedBox(height: visibleHeight * 0.006),
+                        if (_editing)
+                          SizedBox(
+                            width: double.infinity,
+                            height: visibleHeight * 0.060,
+                            child: ElevatedButton(
+                              onPressed: _hasChanges && !_updating
+                                  ? _updateProfile
+                                  : null,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: goldColor,
+                                disabledBackgroundColor: Colors.grey.shade300,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(
+                                    size.width * 0.077,
+                                  ),
+                                ),
+                                elevation: size.width * 0.013,
+                              ),
+                              child: _updating
+                                  ? const CircularProgressIndicator(
+                                      color: Colors.white,
+                                    )
+                                  : Text(
+                                      "SAVE DETAILS",
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: size.width * 0.038,
+                                      ),
+                                    ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
@@ -615,10 +655,7 @@ class _HSEWorkerEditProfileScreenState
                         minWidth: size.width * 0.090,
                         minHeight: size.width * 0.090,
                       ),
-                      icon: Icon(
-                        Icons.arrow_back,
-                        color: Colors.white,
-                      ),
+                      icon: Icon(Icons.arrow_back, color: Colors.white),
                       onPressed: () => Navigator.pop(context),
                     ),
                   ),
